@@ -66,8 +66,6 @@ public:
 protected:
     virtual void onChanged(const App::Property* prop) override;
     Base::BoundBox3d bbox;
-    std::string getSVGHead(void);
-    std::string getSVGTail(void);
     
 private:
     static const char* RenderModeEnums[];

@@ -96,50 +96,15 @@ App::DocumentObjectExecReturn *DrawViewArch::execute(void)
     if (!keepUpdated()) {
         return App::DocumentObject::StdReturn;
     }
+    std::string FeatName = getNameInDocument();
 
-    App::DocumentObject* sourceObj = Source.getValue();
-    if (sourceObj) {
-        std::string svgFrag;
-        std::string svgHead = getSVGHead();
-        std::string svgTail = getSVGTail();
-        std::string FeatName = getNameInDocument();
-        std::string SourceName = sourceObj->getNameInDocument();
-        // ArchSectionPlane.getSVG(section,allOn=False,renderMode="Wireframe",showHidden=False,showFill=False,scale=1,linewidth=1,fontsize=1):
+    // threaded processing
+    Base::Interpreter().runString("import ArchSectionPlane");
 
-        std::stringstream paramStr;
-        paramStr << ",allOn=" << (AllOn.getValue() ? "True" : "False")
-                 << ",renderMode=" << RenderMode.getValue()
-                 << ",showHidden=" << (ShowHidden.getValue() ? "True" : "False")
-                 << ",showFill=" << (ShowFill.getValue() ? "True" : "False")
-                 << ",scale=" << getScale()
-                 << ",linewidth=" << LineWidth.getValue()
-                 << ",fontsize=" << FontSize.getValue()
-                 << ",techdraw=True"
-                 << ",rotation=" << Rotation.getValue();
-
-        Base::Interpreter().runString("import ArchSectionPlane");
-        Base::Interpreter().runStringArg("svgBody = ArchSectionPlane.getSVG(App.activeDocument().%s %s)",
-                                         SourceName.c_str(),paramStr.str().c_str());
-        Base::Interpreter().runStringArg("App.activeDocument().%s.Symbol = '%s' + svgBody + '%s'",
-                                          FeatName.c_str(),svgHead.c_str(),svgTail.c_str());
-    }
-    requestPaint();
+    Base::Interpreter().runStringArg("ArchSectionPlane.startRenderSection(App.activeDocument().%s)",FeatName.c_str());
     return DrawView::execute();
 }
 
-std::string DrawViewArch::getSVGHead(void)
-{
-    std::string head = std::string("<svg\\n") +
-                       std::string("	xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\"\\n") +
-                       std::string("	xmlns:freecad=\"http://www.freecadweb.org/wiki/index.php?title=Svg_Namespace\">\\n");
-    return head;
-}
-
-std::string DrawViewArch::getSVGTail(void)
-{
-    std::string tail = "\\n</svg>";
-    return tail;
-}
 
 //DVA is still Source PropertyLink so needs different logic vs DV::Restore
 void DrawViewArch::Restore(Base::XMLReader &reader)

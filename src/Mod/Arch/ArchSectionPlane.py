@@ -23,9 +23,10 @@
 
 import FreeCAD,WorkingPlane,math,Draft,ArchCommands,DraftVecUtils,ArchComponent
 from FreeCAD import Vector
+from PySide import QtCore
 if FreeCAD.GuiUp:
     import FreeCADGui
-    from PySide import QtCore, QtGui
+    from PySide import QtGui
     from DraftTools import translate
     from pivy import coin
     from PySide.QtCore import QT_TRANSLATE_NOOP
@@ -95,7 +96,11 @@ def makeSectionView(section,name="View"):
     view.Label = translate("Arch","View of")+" "+section.Name
     return view
 
+
 def looksLikeDraft(o):
+    
+    "Returns True if the given object has no volume (ie. is flat)"
+    
     # If there is no shape at all ignore it
     if not hasattr(o, 'Shape') or o.Shape.isNull():
         return False
@@ -108,7 +113,10 @@ def looksLikeDraft(o):
     # If we have a shape, but no volume, it looks like a flat 2D object
     return o.Shape.Volume == 0
 
+
 def getCutShapes(objs,section,showHidden):
+    
+    "cuts objects with the given section shape"
 
     import Part,DraftGeomUtils
     shapes = []
@@ -985,3 +993,298 @@ class SectionPlaneTaskPanel:
 
 if FreeCAD.GuiUp:
     FreeCADGui.addCommand('Arch_SectionPlane',_CommandSectionPlane())
+
+
+# Threaded rendering
+
+
+def startRenderSection(sectionview):
+    
+    """Renders the given section in a separate thread"""
+    
+    if hasattr(FreeCAD,"ArchRenderThread"):
+        print("Render thread in process")
+    else:
+        print("Starting rendering thread")
+        FreeCAD.ArchRenderThread = RenderThread(sectionview)
+        FreeCAD.ArchRenderThread.result.connect(renderSectionFinished)
+        QtCore.QTimer.singleShot(0,FreeCAD.ArchRenderThread.start)
+
+
+def renderSectionFinished(svg):
+    
+    """Called by a render thread when a section has been rendered"""
+    
+    print("Finished rendering thread")
+    print(svg)
+    if svg and hasattr(FreeCAD,"ArchRenderThread"):
+        sectionview = FreeCAD.ArchRenderThread.sectionview
+        if FreeCAD.ArchRenderThread.isFinished():
+            del FreeCAD.ArchRenderThread
+        sectionview.Symbol = svg
+        sectionview.recompute()
+    
+
+class RenderThread(QtCore.QThread):
+
+    """Renders an SVG representation from a TechDraw ArchView"""
+
+    result = QtCore.Signal(str) # signal that contains the final svg code rendered for the given arch section view
+
+    def __init__(self, sectionview):
+
+        QtCore.QThread.__init__(self)
+        self.sectionview = sectionview
+
+    def run(self):
+
+        svg = "<svg\n"
+        svg += "    xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\"\n"
+        svg += "    xmlns:freecad=\"http://www.freecadweb.org/wiki/index.php?title=Svg_Namespace\">\n"
+
+        section = self.sectionview.Source
+        renderMode = self.sectionview.RenderMode
+        allOn = self.sectionview.AllOn
+        showHidden = self.sectionview.ShowHidden
+        scale = self.sectionview.Scale
+        rotation = self.sectionview.Rotation
+        linewidth = self.sectionview.LineWidth
+        lineColor = (0.0,0.0,0.0)
+        fontsize = self.sectionview.FontSize
+        showFill = self.sectionview.ShowFill
+        fillColor = (0.8,0.8,0.8)
+        techdraw = True
+
+        if not section:
+            return
+        if not section.Objects:
+            return
+        import Part,DraftGeomUtils
+        p = FreeCAD.Placement(section.Placement)
+        direction = p.Rotation.multVec(FreeCAD.Vector(0,0,1))
+        objs = Draft.getGroupContents(section.Objects,walls=True,addgroups=True)
+        if not allOn:
+                objs = Draft.removeHidden(objs)
+    
+        # separate spaces and Draft objects
+        spaces = []
+        nonspaces = []
+        drafts = []
+        windows = []
+        cutface = None
+        for o in objs:
+            if Draft.getType(o) == "Space":
+                spaces.append(o)
+            elif Draft.getType(o) in ["Dimension","Annotation","Label"]:
+                drafts.append(o)
+            elif o.isDerivedFrom("Part::Part2DObject"):
+                drafts.append(o)
+            elif looksLikeDraft(o):
+                drafts.append(o)
+            else:
+                nonspaces.append(o)
+            if Draft.getType(o) == "Window":
+                windows.append(o)
+        objs = nonspaces
+    
+        archUserParameters = FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/Arch")
+        scaledLineWidth = linewidth/scale
+        svgLineWidth = str(scaledLineWidth) + 'px'
+        st = archUserParameters.GetFloat("CutLineThickness",2)
+        svgCutLineWidth = str(scaledLineWidth * st) + 'px'
+        yt = archUserParameters.GetFloat("SymbolLineThickness",0.6)
+        svgSymbolLineWidth = str(linewidth * yt)
+        hiddenPattern = archUserParameters.GetString("archHiddenPattern","30,10")
+        svgHiddenPattern = hiddenPattern.replace(" ","")
+        fillpattern = '<pattern id="sectionfill" patternUnits="userSpaceOnUse" patternTransform="matrix(5,0,0,5,0,0)"'
+        fillpattern += ' x="0" y="0" width="10" height="10">'
+        fillpattern += '<g>'
+        fillpattern += '<rect width="10" height="10" style="stroke:none; fill:#ffffff" /><path style="stroke:#000000; stroke-width:1" d="M0,0 l10,10" /></g></pattern>'
+        svgLineColor = Draft.getrgb(lineColor)
+        svg = ''
+    
+        # reading cached version
+        svgcache = None
+        if hasattr(section.Proxy,"svgcache") and section.Proxy.svgcache:
+            svgcache = section.Proxy.svgcache[0]
+            if section.Proxy.svgcache[1] != renderMode:
+                svgcache = None
+            if section.Proxy.svgcache[2] != showHidden:
+                svgcache = None
+            if section.Proxy.svgcache[3] != showFill:
+                svgcache = None
+    
+        # generating SVG
+        if renderMode in ["Solid",1]:
+            if not svgcache:
+                svgcache = ''
+                # render using the Arch Vector Renderer
+                import ArchVRM, WorkingPlane
+                wp = WorkingPlane.plane()
+                wp.setFromPlacement(section.Placement)
+                #wp.inverse()
+                render = ArchVRM.Renderer()
+                render.setWorkingPlane(wp)
+                render.addObjects(objs)
+                if showHidden:
+                    render.cut(section.Shape,showHidden)
+                else:
+                    render.cut(section.Shape)
+                svgcache += '<g transform="scale(1,-1)">\n'
+                svgcache += render.getViewSVG(linewidth="SVGLINEWIDTH")
+                svgcache += fillpattern
+                svgcache += render.getSectionSVG(linewidth="SVGCUTLINEWIDTH",
+                                            fillpattern="sectionfill")
+                if showHidden:
+                    svgcache += render.getHiddenSVG(linewidth="SVGLINEWIDTH")
+                svgcache += '</g>\n'
+                # print(render.info())
+                section.Proxy.svgcache = [svgcache,renderMode,showHidden,showFill]
+        else:
+            
+            shapes = []
+            hshapes = []
+            sshapes = []
+            for o in objs:
+                if o.isDerivedFrom("Part::Feature"):
+                    if o.Shape.isNull():
+                        pass
+                    elif section.OnlySolids:
+                        if o.Shape.isValid():
+                            shapes.extend(o.Shape.Solids)
+                        else:
+                            #print(section.Label,": Skipping invalid object:",o.Label)
+                            pass
+                    else:
+                        shapes.append(o.Shape)
+            cutface,cutvolume,invcutvolume = ArchCommands.getCutVolume(section.Shape.copy(),shapes)
+            if cutvolume:
+                nsh = []
+                for sh in shapes:
+                    for sol in sh.Solids:
+                        if sol.Volume < 0:
+                            sol.reverse()
+                        c = sol.cut(cutvolume)
+                        s = sol.section(cutface)
+                        try:
+                            wires = DraftGeomUtils.findWires(s.Edges)
+                            for w in wires:
+                                f = Part.Face(w)
+                                sshapes.append(f)
+                            #s = Part.Wire(s.Edges)
+                            #s = Part.Face(s)
+                        except Part.OCCError:
+                            #print "ArchDrawingView: unable to get a face"
+                            sshapes.append(s)
+                        nsh.extend(c.Solids)
+                        #sshapes.append(s)
+                        if showHidden:
+                            c = sol.cut(invcutvolume)
+                            hshapes.append(c)
+                shapes = nsh
+
+            if not svgcache:
+                svgcache = ""
+                # render using the Drawing module
+                import Drawing, Part
+                if shapes:
+                    baseshape = Part.makeCompound(shapes)
+                    style = {'stroke':       "SVGLINECOLOR",
+                             'stroke-width': "SVGLINEWIDTH"}
+                    svgcache += Drawing.projectToSVG(
+                        baseshape, direction,
+                        hStyle=style, h0Style=style, h1Style=style,
+                        vStyle=style, v0Style=style, v1Style=style)
+                if hshapes:
+                    hshapes = Part.makeCompound(hshapes)
+                    style = {'stroke':           "SVGLINECOLOR",
+                             'stroke-width':     "SVGLINEWIDTH",
+                             'stroke-dasharray': "SVGHIDDENPATTERN"}
+                    svgcache += Drawing.projectToSVG(
+                        hshapes, direction,
+                        hStyle=style, h0Style=style, h1Style=style,
+                        vStyle=style, v0Style=style, v1Style=style)
+                if sshapes:
+                    if showFill:
+                        #svgcache += fillpattern
+                        svgcache += '<g transform="rotate(180)">\n'
+                        for s in sshapes:
+                            if s.Edges:
+                                #svg += Draft.getSVG(s,direction=direction.negative(),linewidth=0,fillstyle="sectionfill",color=(0,0,0))
+                                # temporarily disabling fill patterns
+                                svgcache += Draft.getSVG(s, direction=direction.negative(),
+                                    linewidth=0,
+                                    fillstyle=Draft.getrgb(fillColor),
+                                    color=lineColor)
+                        svgcache += "</g>\n"
+                    sshapes = Part.makeCompound(sshapes)
+                    style = {'stroke':       "SVGLINECOLOR",
+                             'stroke-width': "SVGCUTLINEWIDTH"}
+                    svgcache += Drawing.projectToSVG(
+                        sshapes, direction,
+                        hStyle=style, h0Style=style, h1Style=style,
+                        vStyle=style, v0Style=style, v1Style=style)
+                section.Proxy.svgcache = [svgcache,renderMode,showHidden,showFill]
+        svgcache = svgcache.replace("SVGLINECOLOR",svgLineColor)
+        svgcache = svgcache.replace("SVGLINEWIDTH",svgLineWidth)
+        svgcache = svgcache.replace("SVGHIDDENPATTERN",svgHiddenPattern)
+        svgcache = svgcache.replace("SVGCUTLINEWIDTH",svgCutLineWidth)
+        svg += svgcache
+    
+        if drafts:
+            if not techdraw:
+                svg += '<g transform="scale(1,-1)">'
+            for d in drafts:
+                svg += Draft.getSVG(d, scale=scale, linewidth=svgSymbolLineWidth,
+                                    fontsize=fontsize, direction=direction, color=lineColor,
+                                    techdraw=techdraw, rotation=rotation)
+            if not techdraw:
+                svg += '</g>'
+    
+        # filter out spaces not cut by the section plane
+        if cutface and spaces:
+            spaces = [s for s in spaces if s.Shape.BoundBox.intersect(cutface.BoundBox)]
+        if spaces:
+            if not techdraw:
+                svg += '<g transform="scale(1,-1)">'
+            for s in spaces:
+                svg += Draft.getSVG(s, scale=scale, linewidth=svgSymbolLineWidth,
+                                    fontsize=fontsize, direction=direction, color=lineColor,
+                                    techdraw=techdraw, rotation=rotation)
+            if not techdraw:
+                svg += '</g>'
+    
+        # add additional edge symbols from windows
+        cutwindows = []
+        if cutface and windows:
+            cutwindows = [w.Name for w in windows if w.Shape.BoundBox.intersect(cutface.BoundBox)]
+        if windows:
+            sh = []
+            for w in windows:
+                if not hasattr(w.Proxy,"sshapes"):
+                    w.Proxy.execute(w)
+                if hasattr(w.Proxy,"sshapes"):
+                    if w.Proxy.sshapes and (w.Name in cutwindows):
+                        c = Part.makeCompound(w.Proxy.sshapes)
+                        c.Placement = w.Placement
+                        sh.append(c)
+                # buggy for now...
+                #if hasattr(w.Proxy,"vshapes"):
+                #    if w.Proxy.vshapes:
+                #        c = Part.makeCompound(w.Proxy.vshapes)
+                #        c.Placement = w.Placement
+                #        sh.append(c)
+            if sh:
+                if not techdraw:
+                    svg += '<g transform="scale(1,-1)">'
+                for s in sh:
+                    svg += Draft.getSVG(s, scale=scale,
+                                        linewidth=svgSymbolLineWidth,
+                                        fontsize=fontsize, fillstyle="none",
+                                        direction=direction, color=lineColor,
+                                        techdraw=techdraw, rotation=rotation)
+                if not techdraw:
+                    svg += '</g>'
+    
+        svg += "\n</svg>"
+        self.result.emit(svg)
